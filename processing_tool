@@ -1,0 +1,322 @@
+# -*- coding: utf-8 -*-
+
+from qgis.PyQt.QtCore import QCoreApplication  #pour la méthode self.tr qui permet de rajouter des textes àu processing tool UI
+from qgis.PyQt.QtGui import QColor #pour définir les couleurs dans la symbologie des couches
+from qgis.core import (QgsProcessing, #obligé pour les processing tools
+                       QgsProcessingException, #pour la gestion des erreurs
+                       QgsProcessingAlgorithm, #obligé pour les processing tools
+                       QgsProcessingParameterNumber, #pour les inputs numeriques
+                       QgsProcessingParameterString, #pour les inputs textuels
+                       QgsProcessingParameterRasterDestination, #pour le output path du raster
+                       QgsRasterLayer, #pour charger le output raster dans qgis
+                       QgsSingleBandPseudoColorRenderer, #pour faire le rendu pseudocouleur dans le output
+                       QgsColorRampShader, #pour faire une échelle de discrétisation (symbologie)
+                       QgsRasterShader, #Pour appliquer le color ramp a un raster
+                       QgsRasterRenderer, #utiliser dans les autres fonctions de symbologie raster (si jai bien compris...)
+                       QgsProject #pour ajouter le raster dans le projet actuel qgis
+                       )
+import ee #pour aller chercher les données via le api
+import geemap #pour exporter le raster de earth engine vers qgis
+
+
+class ProcessingAlgorithm(QgsProcessingAlgorithm):
+
+
+    # 2 constantes qu'il faut énoncé au début des processings tools (si jai bien compris la docu...)
+
+    INPUT = 'INPUT'
+    OUTPUT = 'OUTPUT'
+
+#La série de commentaire en """ provient du template de processing tools de QGIS et je les conserve pour me rappeler qu'est-ce qui fait quoi
+
+    def tr(self, string):
+        """
+        Returns a translatable string with the self.tr() function.
+        """
+        return QCoreApplication.translate('Processing', string)
+
+    def createInstance(self):
+        return ProcessingAlgorithm()
+
+    def name(self):
+        """
+        Returns the algorithm name, used for identifying the algorithm. This
+        string should be fixed for the algorithm, and must not be localised.
+        The name should be unique within each provider. Names should contain
+        lowercase alphanumeric characters only and no spaces or other
+        formatting characters.
+        """
+        return 'indicediffcalculator'
+
+    def displayName(self):
+        """
+        Returns the translated algorithm name, which should be used for any
+        user-visible display of the algorithm name.
+        """
+        return self.tr('Indice difference ee Calculator')
+
+    def group(self):
+        """
+        Returns the name of the group this algorithm belongs to. This string
+        should be localised.
+        """
+        return self.tr('Remote Sensing')
+
+    def groupId(self):
+        """
+        Returns the unique ID of the group this algorithm belongs to. This
+        string should be fixed for the algorithm, and must not be localised.
+        The group id should be unique within each provider. Group id should
+        contain lowercase alphanumeric characters only and no spaces or other
+        formatting characters.
+        """
+        return 'remotesensing'
+
+    def shortHelpString(self):
+        """
+        Returns a localised short helper string for the algorithm. This string
+        should provide a basic description about what the algorithm does and the
+        parameters and outputs associated with it..
+        """
+        return self.tr("This algorithm takes lat/lon coordinate, buffer value in meters, two dates formatted as year-month-day and an indice (NDVI. NDWI, NDDI, SAVI, EVI). It will search Earth Engine landsat Libraries to calculate the appropriate indice values for both dates and then output the difference between the two rasters")
+
+    def initAlgorithm(self, config=None):
+        """
+        Here we define the inputs and output of the algorithm, along
+        with some other properties.
+        """
+
+        # We add the input longitude number.
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                'longitude',
+                self.tr('Input longitude'),
+                type=QgsProcessingParameterNumber.Double
+            )
+        )
+        # We add the input latitude number.
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                'latitude',
+                self.tr('Input latitude '),
+                type=QgsProcessingParameterNumber.Double
+            )
+        )
+        # We add the input buffer distance number.
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                'buffer',
+                self.tr('Input buffer distance'),
+                type=QgsProcessingParameterNumber.Double
+
+            )
+        )
+
+        # We add the input start date string.
+        self.addParameter(
+            QgsProcessingParameterString(
+                'date_start',
+                self.tr('Input first date year-month-day')
+            )
+        )
+
+        # We add the input end date string.
+        self.addParameter(
+            QgsProcessingParameterString(
+                'date_end',
+                self.tr('Input end date year-month-day')
+            )
+        )
+
+        #Add the indice selection string
+        self.addParameter(
+            QgsProcessingParameterString(
+            'indice',
+            self.tr('Input desired indice')
+            )
+        )
+
+        #We add the output path parameter
+        self.addParameter(
+            QgsProcessingParameterRasterDestination(
+                "OUTPUT_PATH",
+                self.tr('Output raster layer path')
+            )
+        )
+
+
+    def processAlgorithm(self, parameters, context, feedback):
+        try:
+            # Récupération des paramètres
+            lon = self.parameterAsDouble(parameters, 'longitude', context)
+            lat = self.parameterAsDouble(parameters, 'latitude', context)
+            buffer_distance = self.parameterAsDouble(parameters, 'buffer', context)
+            start_date = self.parameterAsString(parameters, 'date_start', context)
+            end_date = self.parameterAsString(parameters, 'date_end', context)
+            indice = self.parameterAsString(parameters, 'indice', context)
+            output_path = self.parameterAsOutputLayer(parameters,'OUTPUT_PATH', context)
+
+
+            # Initialisation de GEE
+            ee.Initialize()
+
+            # Création de la bounding box
+            def buffer_box(lon, lat, buffer_distance):
+                point_lonlat = ee.Geometry.Point(lon, lat)
+                return point_lonlat.buffer(buffer_distance).bounds()
+
+            bounding_box = buffer_box(lon, lat, buffer_distance)
+
+            # Fonction pour récupérer les collections Landsat
+            def get_landsat_collection(year):
+                if 1985 <= year <= 1999:
+                    return ee.ImageCollection("LANDSAT/LT05/C02/T1_L2"), ['SR_B5',"SR_B4", "SR_B3", 'SR_B1']
+                elif 2000 <= year <= 2014:
+                    return ee.ImageCollection("LANDSAT/LE07/C02/T1_L2"), ['SR_B5',"SR_B4", "SR_B3", 'SR_B1']
+                elif 2015 <= year <= 2024:
+                    return ee.ImageCollection("LANDSAT/LC08/C02/T1_L2"), ['SR_B6',"SR_B5", "SR_B4", 'SR_B2']
+                else:
+                    raise ValueError("Date outside of Landsat Data range")
+
+            #Fonction pour appliquer une symbologie a la couche
+            def apply_symbology(layer):
+                if not layer.isValid():
+                    raise QgsProcessingException("Layer is invalid; cannot apply symbology.")
+
+                # Créer un shader basé sur des classes discrètes
+                color_map = [
+                    QgsColorRampShader.ColorRampItem(1, QColor('red'), 'Decrease'),
+                    QgsColorRampShader.ColorRampItem(2, QColor('gray'), 'Stable'),
+                    QgsColorRampShader.ColorRampItem(3, QColor('green'), 'Increase'),
+                ]
+
+                color_ramp_shader = QgsColorRampShader()
+                color_ramp_shader.setColorRampType(QgsColorRampShader.Discrete)
+                color_ramp_shader.setColorRampItemList(color_map)
+
+                raster_shader = QgsRasterShader()
+                raster_shader.setRasterShaderFunction(color_ramp_shader)
+
+                # Appliquer le renderer single band pseudo color
+                renderer = QgsSingleBandPseudoColorRenderer(
+                    layer.dataProvider(),
+                    1,  # Première bande
+                    raster_shader
+                )
+
+                layer.setRenderer(renderer)
+                layer.triggerRepaint()
+
+
+            # Calcul des années
+            year1 = ee.Date(start_date).get("year").getInfo()
+            year2 = ee.Date(end_date).get("year").getInfo()
+
+            # Récupération des collections Landsat
+            collection1, bands1 = get_landsat_collection(year1)
+            collection2, bands2 = get_landsat_collection(year2)
+
+            # Filtrage des collections
+            collection1 = collection1.filterBounds(bounding_box).filterDate(start_date, ee.Date(start_date).advance(10, 'day'))
+            collection2 = collection2.filterBounds(bounding_box).filterDate(end_date, ee.Date(end_date).advance(10, 'day'))
+
+            # Vérification des collections
+            if collection1.size().getInfo() == 0:
+                raise QgsProcessingException(self.tr("No images found for the first date range."))
+            if collection2.size().getInfo() == 0:
+                raise QgsProcessingException(self.tr("No images found for the second date range."))
+
+            # Calcul des indices
+            if indice == 'NDVI':
+                first_image = collection1.map(lambda img: img.normalizedDifference([bands1[1],bands1[2]]).rename(indice)).mean().clip(bounding_box)
+                second_image = collection2.map(lambda img: img.normalizedDifference([bands2[1],bands2[2]]).rename(indice)).mean().clip(bounding_box)
+
+            elif indice == 'NDWI':
+                first_image = collection1.map(lambda img: img.normalizedDifference([bands1[0],bands1[1]]).rename(indice)).mean().clip(bounding_box)
+                second_image = collection2.map(lambda img: img.normalizedDifference([bands2[0],bands2[1]]).rename(indice)).mean().clip(bounding_box)
+
+            elif indice == "NDDI":
+                first_image = collection1.map(lambda img: img.expression(
+                    '((NDWI - NDVI) / (NDWI + NDVI))', {
+                        'NDWI': img.normalizedDifference([bands1[1], bands1[2]]),
+                        'NDVI': img.normalizedDifference([bands1[0], bands1[1]])
+                    }).rename(indice)).mean().clip(bounding_box)
+
+                second_image = collection2.map(lambda img: img.expression(
+                    '((NDWI - NDVI) / (NDWI + NDVI))', {
+                        'NDWI': img.normalizedDifference([bands2[1], bands2[2]]),
+                        'NDVI': img.normalizedDifference([bands2[0], bands2[1]])
+                    }).rename(indice)).mean().clip(bounding_box)
+
+            elif indice == "SAVI":
+                first_image = collection1.map(lambda img: img.expression(
+                "((NIR - RED) * (1 + L)) / (NIR + RED + L)", {
+                "NIR" : img.select(bands1[1]),
+                "RED" : img.select(bands1[2]),
+                "L" : 0.5
+                }).rename(indice)).mean().clip(bounding_box)
+                second_image = collection2.map(lambda img: img.expression(
+                "((NIR - RED) * (1 + L)) / (NIR + RED + L)", {
+                "NIR" : img.select(bands2[1]),
+                "RED" : img.select(bands2[2]),
+                "L" : 0.5
+                }).rename(indice)).mean().clip(bounding_box)
+
+            elif indice == "EVI":
+                first_image = collection1.map(lambda img: img.expression(
+                "2.5 * ((NIR - RED) / ((NIR + 6) * (RED - 7.5) * (BLUE + 1)))", {
+                "NIR" : img.select(bands1[1]),
+                "RED" : img.select(bands1[2]),
+                "BLUE" : img.select(bands1[3])
+                }).rename(indice)).mean().clip(bounding_box)
+                second_image = collection2.map(lambda img: img.expression(
+                "2.5 * ((NIR - RED) / ((NIR + 6) * (RED - 7.5) * (BLUE + 1)))", {
+                "NIR" : img.select(bands2[1]),
+                "RED" : img.select(bands2[2]),
+                "BLUE" : img.select(bands2[3])
+                }).rename(indice)).mean().clip(bounding_box)
+
+            # Vérification des images d'indices
+            if not first_image.getInfo():
+                raise QgsProcessingException(self.tr("First indice image is empty."))
+            if not second_image.getInfo():
+                raise QgsProcessingException(self.tr("Second indice image is empty."))
+
+            # Calcul de la différence d'indice
+            diff_indice = second_image.subtract(first_image)
+
+            # Classification de la différence
+            reclassified = diff_indice \
+                .where(diff_indice.lt(-0.1), 1) \
+                .where(diff_indice.gte(-0.1).And(diff_indice.lte(0.1)), 2) \
+                .where(diff_indice.gt(0.1), 3)
+
+            # Exportation
+            geemap.ee_export_image(
+                reclassified,
+                filename=output_path,
+                scale=30,
+                region=bounding_box.getInfo(),
+                crs="EPSG:4326",
+                file_per_band=False
+            )
+
+            # Chargement dans QGIS
+            raster_layer = QgsRasterLayer(output_path, "Indice_diff_layer")
+            feedback.pushInfo(f"Loading raster from: {output_path}")
+            if raster_layer.isValid():
+
+                #appliquer la symbologie
+                apply_symbology(raster_layer)
+
+                #Charger la couche dans qgis
+                QgsProject.instance().addMapLayer(raster_layer)
+
+
+            else:
+                raise QgsProcessingException(self.tr(f"Raster file exists but is invalid: {output_path}"))
+            return {"OUTPUT": output_path}
+
+
+        except Exception as e:
+            raise QgsProcessingException(self.tr(f"Error: {str(e)}"))
